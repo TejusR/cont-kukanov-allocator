@@ -18,7 +18,7 @@ This repository provides a Python script (`backtest.py`) that implements and bac
    * [Baselines](#baselines)
    * [Grid Search](#grid-search)
    * [Output](#output)
-6. [Example](#example)
+6. [Results](#results)
 7. [Configuring Parameters](#configuring-parameters)
 
 ---
@@ -134,20 +134,9 @@ Prints a JSON object containing:
 
 ---
 
-## Example
+## Result
 
-```python
-{'best_params': {'lambda_over': 0.1, 'lambda_under': 0.0, 'theta_queue': 0.05},
- 'router':    {'cost':  502350.0, 'fill': 5000, 'avg_price': 100.47},
- 'best_ask':  {'cost':  503125.0, 'fill': 5000, 'avg_price': 100.625},
- 'twap':      {'cost':  502900.0, 'fill': 5000, 'avg_price': 100.58},
- 'vwap':      {'cost':  502600.0, 'fill': 5000, 'avg_price': 100.52},
- 'savings_bps': {
-     'vs_best_ask': 15.5,
-     'vs_twap':     11.0,
-     'vs_vwap':      5.0
- }}
-```
+![results](results.png)
 
 ---
 
