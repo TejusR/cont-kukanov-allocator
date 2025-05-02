@@ -1,10 +1,10 @@
 import argparse
 import json
 from types import SimpleNamespace
-from itertools import groupby
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 def compute_cost(split, venues, order_size, lambda_over, lambda_under, theta_queue):
     executed = 0
@@ -46,33 +46,33 @@ def allocate(order_size, venues, lambda_over, lambda_under, theta_queue, step=10
     return best_split, best_cost
 
 def load_snapshots(path):
-
-    # Read the L1 feed, drop duplicate publisher_id per ts_event, sort by ts_event.
-
-    df = pd.read_csv(path)
-    df = df.drop_duplicates(subset=['ts_event','publisher_id'], keep='first')
+    df = pd.read_csv(path, parse_dates=['ts_event'])
     df = df.sort_values('ts_event')
     return df
 
 def run_router(snapshots, order_size, lambda_over, lambda_under, theta_queue):
     remaining = order_size
     total_cost = 0.0
+    history = []  # (timestamp, cumulative_cost)
+    for _, raw_group in snapshots.groupby('ts_event'):
+        ts = raw_group['ts_event'].iloc[0]
+        history.append((ts, total_cost))
 
-    for _, group in snapshots.groupby('ts_event'):
         if remaining <= 0:
             break
 
-        venues = []
-        for _, row in group.iterrows():
-            venues.append(SimpleNamespace(
+        group = raw_group.groupby('publisher_id', as_index=False).last()
+        venues = [
+            SimpleNamespace(
                 ask      = row['ask_px_00'],
                 ask_size = int(row['ask_sz_00']),
-                fee      = 0.0,      # placeholder—fill from fee schedule as needed
-                rebate   = 0.0       # placeholder—fill from rebate schedule as needed
-            ))
+                fee      = 0.0,
+                rebate   = 0.0
+            )
+            for _, row in group.iterrows()
+        ]
 
         split, _ = allocate(remaining, venues, lambda_over, lambda_under, theta_queue)
-
         executed = 0
         for qty, v in zip(split, venues):
             exe = min(qty, v.ask_size)
@@ -82,28 +82,30 @@ def run_router(snapshots, order_size, lambda_over, lambda_under, theta_queue):
 
         remaining -= executed
 
-    return total_cost, order_size - remaining
+    return history, total_cost, order_size - remaining
 
 def run_best_ask(snapshots, order_size):
     remaining = order_size
     total_cost = 0.0
+    history = []
+    for _, raw_group in snapshots.groupby('ts_event'):
+        ts = raw_group['ts_event'].iloc[0]
+        history.append((ts, total_cost))
 
-    for _, group in snapshots.groupby('ts_event'):
         if remaining <= 0:
             break
 
+        group = raw_group.groupby('publisher_id', as_index=False).last()
         row = group.loc[group['ask_px_00'].idxmin()]
         exe = min(remaining, int(row['ask_sz_00']))
         total_cost += exe * row['ask_px_00']
         remaining -= exe
 
-    fill = order_size - remaining
-    return total_cost, fill
+    return history, total_cost, order_size - remaining
 
 def run_twap(snapshots, order_size):
-
     df = snapshots.copy()
-    df['minute'] = pd.to_datetime(df['ts_event']).dt.floor('min')
+    df['minute'] = df['ts_event'].dt.floor('min')
     minutes = sorted(df['minute'].unique())
     n_buckets = len(minutes)
     per_bucket = order_size // n_buckets
@@ -111,15 +113,18 @@ def run_twap(snapshots, order_size):
 
     remaining = order_size
     total_cost = 0.0
-
+    history = []
     for minute in minutes:
+        # record cost at start of bucket
+        ts = minute
+        history.append((ts, total_cost))
+
         target = per_bucket + (1 if extra > 0 else 0)
         extra -= 1 if extra > 0 else 0
 
         bucket_df = df[df['minute'] == minute]
         bucket_rem = target
-
-        for _, row in bucket_df.iterrows():
+        for _, row in bucket_df.groupby('publisher_id', as_index=False).last().iterrows():
             if bucket_rem <= 0:
                 break
             exe = min(bucket_rem, int(row['ask_sz_00']))
@@ -128,23 +133,30 @@ def run_twap(snapshots, order_size):
 
         remaining -= (target - bucket_rem)
 
-    fill = order_size - remaining
-    return total_cost, fill
+    return history, total_cost, order_size - remaining
 
 def run_vwap(snapshots, order_size):
-
-    first = snapshots.groupby('ts_event').first().iloc[0]
-    first_group = snapshots[snapshots['ts_event'] == first.name]
+    # first = snapshots.groupby('ts_event').first().iloc[0]
+    # first_group = snapshots[snapshots['ts_event'] == first.name]
+    first_ts = snapshots['ts_event'].iloc[0]
+    first_group = (
+        snapshots[snapshots['ts_event'] == first_ts]
+          .groupby('publisher_id', as_index=False)
+          .last()
+    )
     depths = first_group.set_index('publisher_id')['ask_sz_00'].astype(int)
     weights = depths / depths.sum()
-    split = (weights * order_size).astype(int).to_dict()
+    split_map = (weights * order_size).astype(int).to_dict()
 
-    remaining = split.copy()
+    remaining = dict(split_map)
     total_cost = 0.0
+    history = []
 
-    for _, group in snapshots.groupby('ts_event'):
-        if sum(remaining.values()) <= 0:
-            break
+    for _, raw_group in snapshots.groupby('ts_event'):
+        ts = raw_group['ts_event'].iloc[0]
+        history.append((ts, total_cost))
+
+        group = raw_group.groupby('publisher_id', as_index=False).last()
         for pid, rem in list(remaining.items()):
             if rem <= 0:
                 continue
@@ -156,68 +168,106 @@ def run_vwap(snapshots, order_size):
             total_cost += exe * row['ask_px_00']
             remaining[pid] -= exe
 
-    fill = order_size - sum(remaining.values())
-    return total_cost, fill
+        if sum(remaining.values()) <= 0:
+            break
+
+    return history, total_cost, order_size - sum(remaining.values())
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', default='l1_day.csv',
-                        help='CSV of L1 feed (ts_event,publisher_id,ask_px_00,ask_sz_00)')
+                        help='Path to L1 CSV feed')
     args = parser.parse_args()
 
-    ORDER_SIZE = 5_000
+    ORDER_SIZE = 5000
     snaps = load_snapshots(args.data)
 
-    # small grid search over the three risk params 
+    # grid search
     lambda_over_vals  = [0.0, 0.1, 0.2]
     lambda_under_vals = [0.0, 0.1, 0.2]
     theta_queue_vals = [0.0, 0.05, 0.1]
 
     best = {'params': None, 'cost': float('inf'), 'fill': 0}
+    best_history = None
     for lo in lambda_over_vals:
         for lu in lambda_under_vals:
             for tq in theta_queue_vals:
-                cost, fill = run_router(snaps, ORDER_SIZE, lo, lu, tq)
+                hist, cost, fill = run_router(snaps, ORDER_SIZE, lo, lu, tq)
                 if cost < best['cost']:
-                    best = {'params': {'lambda_over': lo,
-                                       'lambda_under': lu,
-                                       'theta_queue': tq},
-                            'cost': cost, 'fill': fill}
+                    best = {
+                        'params': {'lambda_over': lo,
+                                   'lambda_under': lu,
+                                   'theta_queue': tq},
+                        'cost': cost,
+                        'fill': fill
+                    }
+                    best_history = hist
 
-    ba_cost, ba_fill     = run_best_ask(snaps, ORDER_SIZE)
-    tw_cost, tw_fill     = run_twap  (snaps, ORDER_SIZE)
-    vw_cost, vw_fill     = run_vwap  (snaps, ORDER_SIZE)
+    # baselines
+    ba_hist, ba_cost, ba_fill = run_best_ask(snaps, ORDER_SIZE)
+    tw_hist, tw_cost, tw_fill = run_twap(snaps, ORDER_SIZE)
+    vw_hist, vw_cost, vw_fill = run_vwap(snaps, ORDER_SIZE)
 
+    # print JSON summary
     out = {
-        'best_params':        best['params'],
+        'best_params': best['params'],
         'router': {
-            'cost':        best['cost'],
-            'fill':        best['fill'],
-            'avg_price':   best['cost']/best['fill'] if best['fill']>0 else None
+            'cost':      best['cost'],
+            'fill':      best['fill'],
+            'avg_price': best['cost'] / best['fill'] if best['fill']>0 else None
         },
         'best_ask': {
             'cost':      ba_cost,
             'fill':      ba_fill,
-            'avg_price': ba_cost/ba_fill if ba_fill>0 else None
+            'avg_price': ba_cost / ba_fill if ba_fill>0 else None
         },
         'twap': {
             'cost':      tw_cost,
             'fill':      tw_fill,
-            'avg_price': tw_cost/tw_fill if tw_fill>0 else None
+            'avg_price': tw_cost / tw_fill if tw_fill>0 else None
         },
         'vwap': {
             'cost':      vw_cost,
             'fill':      vw_fill,
-            'avg_price': vw_cost/vw_fill if vw_fill>0 else None
+            'avg_price': vw_cost / vw_fill if vw_fill>0 else None
         },
         'savings_bps': {
-            'vs_best_ask': (ba_cost  - best['cost'])/ORDER_SIZE * 1e4,
-            'vs_twap':     (tw_cost  - best['cost'])/ORDER_SIZE * 1e4,
-            'vs_vwap':     (vw_cost  - best['cost'])/ORDER_SIZE * 1e4,
+            'vs_best_ask': (ba_cost - best['cost']) / ORDER_SIZE * 1e4,
+            'vs_twap':     (tw_cost - best['cost']) / ORDER_SIZE * 1e4,
+            'vs_vwap':     (vw_cost - best['cost']) / ORDER_SIZE * 1e4,
         }
     }
-
     print(json.dumps(out, indent=2))
+
+    # build DataFrames for plotting
+    df_router = pd.DataFrame(best_history, columns=['ts_event','cum_cost'])
+    df_router['ts_event'] = pd.to_datetime(df_router['ts_event'])
+    df_router.set_index('ts_event', inplace=True)
+
+    df_ba = pd.DataFrame(ba_hist, columns=['ts_event','cum_cost'])
+    df_ba['ts_event'] = pd.to_datetime(df_ba['ts_event'])
+    df_ba.set_index('ts_event', inplace=True)
+
+    df_twap = pd.DataFrame(tw_hist, columns=['ts_event','cum_cost'])
+    df_twap['ts_event'] = pd.to_datetime(df_twap['ts_event'])
+    df_twap.set_index('ts_event', inplace=True)
+
+    df_vwap = pd.DataFrame(vw_hist, columns=['ts_event','cum_cost'])
+    df_vwap['ts_event'] = pd.to_datetime(df_vwap['ts_event'])
+    df_vwap.set_index('ts_event', inplace=True)
+
+    # plot
+    plt.figure()
+    plt.plot(df_router.index, df_router['cum_cost'], label='Router')
+    plt.plot(df_ba.index,    df_ba['cum_cost'],    label='Best‑Ask')
+    plt.plot(df_twap.index,  df_twap['cum_cost'],  label='TWAP')
+    plt.plot(df_vwap.index,  df_vwap['cum_cost'],  label='VWAP')
+    plt.xlabel('Time')
+    plt.ylabel('Cumulative Cost')
+    plt.title('Cumulative Execution Cost Over Time')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == '__main__':
     main()
